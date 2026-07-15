@@ -101,7 +101,18 @@ fun DevicePickerScreen(
     ) {
         if (isBluetoothEnabled(context)) {
             prerequisitesMessage = null
-            viewModel.startDeviceDiscovery()
+            startScanWithPrerequisites(
+                context = context,
+                onMissingPermission = {
+                    prerequisitesMessage = it
+                },
+                onBluetoothEnableRequired = {
+                    prerequisitesMessage = "Bluetooth is off. Turn it on to discover devices."
+                },
+                onStartScan = {
+                    viewModel.startDeviceDiscovery()
+                }
+            )
         } else {
             prerequisitesMessage = "Bluetooth remains disabled. Enable it and try scanning again."
         }

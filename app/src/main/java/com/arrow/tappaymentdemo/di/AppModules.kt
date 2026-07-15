@@ -1,6 +1,7 @@
 package com.arrow.tappaymentdemo.di
 
 import com.arrow.tappaymentdemo.data.mapper.BackendPaymentRequestMapper
+import com.arrow.tappaymentdemo.data.mapper.PaymentResultSummaryMapper
 import com.arrow.tappaymentdemo.data.repository.PaymentRepositoryImpl
 import com.arrow.tappaymentdemo.domain.repository.PaymentRepository
 import com.arrow.tappaymentdemo.domain.usecase.CancelPaymentUseCase
@@ -31,11 +32,13 @@ val appModule = module {
         )
     }
     single { BackendPaymentRequestMapper() }
+    single { PaymentResultSummaryMapper() }
     single<PaymentRepository> {
         PaymentRepositoryImpl(
             magTekGateway = get(),
             backendPaymentApi = get(),
-            backendPaymentRequestMapper = get()
+            backendPaymentRequestMapper = get(),
+            paymentResultSummaryMapper = get()
         )
     }
 

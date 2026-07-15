@@ -16,6 +16,7 @@ import com.arrow.tappaymentdemo.domain.model.ReaderDevice
 import com.arrow.tappaymentdemo.domain.model.SecurePaymentData
 import com.arrow.tappaymentdemo.domain.model.TransactionState
 import com.magtek.mobile.android.mtusdk.CoreAPI
+import com.magtek.mobile.android.mtusdk.DeviceType
 import com.magtek.mobile.android.mtusdk.EventType
 import com.magtek.mobile.android.mtusdk.IDevice
 import com.magtek.mobile.android.mtusdk.IDeviceListCallback
@@ -24,13 +25,15 @@ import com.magtek.mobile.android.mtusdk.PaymentMethod
 import com.magtek.mobile.android.mtusdk.Transaction
 import java.math.RoundingMode
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 
@@ -39,18 +42,21 @@ class RealMagTekGateway(
     private val callbackMapper: MagTekCallbackToTransactionStateMapper
 ) : MagTekGateway {
 
+    private val gatewayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private val mutableConnectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
     override val connectionState: StateFlow<ConnectionState> = mutableConnectionState.asStateFlow()
 
     private val mutableReaderConnectionState = MutableStateFlow<ReaderConnectionState>(ReaderConnectionState.Idle)
-    val readerConnectionState: StateFlow<ReaderConnectionState> get() = mutableReaderConnectionState.asStateFlow()
+    override val readerConnectionState: StateFlow<ReaderConnectionState> = mutableReaderConnectionState.asStateFlow()
 
     private val mutableDiscoveredDevices = MutableStateFlow<List<ReaderDevice>>(emptyList())
-    val discoveredDevices: StateFlow<List<ReaderDevice>> get() = mutableDiscoveredDevices.asStateFlow()
+    override val discoveredDevices: StateFlow<List<ReaderDevice>> = mutableDiscoveredDevices.asStateFlow()
 
     private var activeDevice: IDevice? = null
     private var activeSubscriber: IEventSubscriber? = null
     private val deviceMap = mutableMapOf<String, IDevice>()
+    private var discoverySessionId: Long = 0L
 
     // Auto-reconnect state
     private var isAutoReconnecting = false
@@ -62,11 +68,13 @@ class RealMagTekGateway(
     companion object {
         private const val SAVED_DEVICE_ID_KEY = "saved_magtek_device_id"
         private const val AUTO_RECONNECT_TIMEOUT_MS = 15000L
+        private const val DISCOVERY_TIMEOUT_MS = 15000
+        private const val TERMINAL_TRANSACTION_TIMEOUT_SECONDS: Byte = 60
+        private const val APP_AUTHORIZATION_WAIT_BUFFER_MS = 15000L
     }
 
     init {
-        Timber.d("🔌 MagTek Gateway initialized - attempting auto-reconnect")
-        startAutoReconnect()
+        Timber.d("🔌 MagTek Gateway initialized - waiting for Bluetooth/permissions before discovery")
     }
 
     // MARK: - Auto-Reconnect
@@ -75,6 +83,12 @@ class RealMagTekGateway(
         val savedDeviceId = getSavedDeviceId()
         if (savedDeviceId == null || isAutoReconnecting || mutableReaderConnectionState.value.isConnected) {
             Timber.d("🔁 Auto-reconnect skipped: savedId=$savedDeviceId, autoRecon=$isAutoReconnecting, connected=${mutableReaderConnectionState.value.isConnected}")
+            return
+        }
+
+        val discoveryError = validateDiscoveryPrerequisites()
+        if (discoveryError != null) {
+            Timber.d("🔁 Auto-reconnect deferred until prerequisites are met: $discoveryError")
             return
         }
 
@@ -89,7 +103,7 @@ class RealMagTekGateway(
         startDiscovery()
 
         // Set timeout - if device not found in time, stop scanning
-        autoReconnectTimeout = GlobalScope.launch {
+        autoReconnectTimeout = gatewayScope.launch {
             try {
                 delay(AUTO_RECONNECT_TIMEOUT_MS)
                 if (isAutoReconnecting) {
@@ -123,7 +137,7 @@ class RealMagTekGateway(
 
     // MARK: - Device Discovery
 
-    fun startDiscovery() {
+    override fun startDiscovery() {
         val discoveryError = validateDiscoveryPrerequisites()
         if (discoveryError != null) {
             Timber.w("⚠️ Discovery prerequisites not met: $discoveryError")
@@ -135,38 +149,30 @@ class RealMagTekGateway(
         }
 
         Timber.d("🔍 Starting device discovery")
+        val sessionId = ++discoverySessionId
         mutableReaderConnectionState.value = ReaderConnectionState.Scanning
         mutableDiscoveredDevices.value = emptyList()
         deviceMap.clear()
 
         val callback = IDeviceListCallback { deviceList ->
-            Timber.d("📡 Device discovery callback: found ${deviceList?.size ?: 0} devices")
-            val devices = mutableListOf<ReaderDevice>()
-            val savedDeviceId = getSavedDeviceId()
-
-            deviceList?.forEachIndexed { index, idevice ->
-                val deviceName = idevice?.let { safeGetDeviceName(it) } ?: "Device-$index"
-                val deviceId = deviceName // Use name as ID for simplicity
-                devices.add(ReaderDevice(id = deviceId, name = deviceName))
-                deviceMap[deviceId] = idevice
-
-                // Check if this is the auto-reconnect device
-                if (isAutoReconnecting && savedDeviceId == deviceId) {
-                    Timber.d("🔁 Found saved device during auto-reconnect: $deviceId")
-                    // Auto-connect to this device
-                    autoReconnectTimeout?.cancel()
-                    isAutoReconnecting = false
-                    connectToDevice(ReaderDevice(id = deviceId, name = deviceName))
-                }
+            if (sessionId != discoverySessionId) {
+                Timber.d("🔍 Ignoring stale discovery callback for session $sessionId")
+                return@IDeviceListCallback
             }
-
-            devices.sortByDescending { it.isLikelyReader }
-            mutableDiscoveredDevices.value = devices
-            Timber.d("📡 Discovered devices: ${devices.map { it.name }}")
+            Timber.d("📡 Device discovery callback: found ${deviceList?.size ?: 0} devices")
+            publishDiscoveredDevices(deviceList.orEmpty())
         }
 
         try {
-            CoreAPI.getDeviceList(appContext, callback)
+            val deviceTypes = DeviceType.values().toList()
+            val initialDevices = CoreAPI.getDeviceList(
+                appContext,
+                deviceTypes,
+                callback,
+                DISCOVERY_TIMEOUT_MS
+            )
+            Timber.d("📡 Initial discovery list size=${initialDevices.size} for session=$sessionId")
+            publishDiscoveredDevices(initialDevices)
         } catch (securityException: SecurityException) {
             val message = "Missing nearby devices permission for discovery"
             Timber.e(securityException, "❌ $message")
@@ -211,24 +217,78 @@ class RealMagTekGateway(
         return ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED
     }
 
+    private fun publishDiscoveredDevices(devices: List<IDevice>) {
+        val discoveredReaders = devices.mapIndexed { index, device ->
+            val readerDevice = mapReaderDevice(device, index)
+            deviceMap[readerDevice.id] = device
+            readerDevice
+        }
+            .distinctBy { it.id }
+            .sortedByDescending { it.isLikelyReader }
+
+        mutableDiscoveredDevices.value = discoveredReaders
+        Timber.d("📡 Discovered devices: ${discoveredReaders.map { it.name }}")
+
+        val savedDeviceId = getSavedDeviceId()
+        if (isAutoReconnecting && savedDeviceId != null) {
+            discoveredReaders.firstOrNull { it.id == savedDeviceId }?.let { savedDevice ->
+                Timber.d("🔁 Found saved device during auto-reconnect: ${savedDevice.name}")
+                autoReconnectTimeout?.cancel()
+                isAutoReconnecting = false
+                connectToDevice(savedDevice)
+            }
+        }
+    }
+
+    private fun mapReaderDevice(device: IDevice, index: Int): ReaderDevice {
+        val deviceName = safeGetDeviceName(device, index)
+        val deviceId = safeGetDeviceId(device, deviceName)
+        return ReaderDevice(id = deviceId, name = deviceName)
+    }
+
     private fun safeGetDeviceName(device: IDevice): String {
         return try {
-            // Try to get the name from the device
-            device.toString().ifEmpty { "Unknown Device" }
+            listOf(
+                device.Name(),
+                device.getDeviceInfo()?.getName(),
+                device.getDeviceInfo()?.getModel(),
+                device.getConnectionInfo()?.getAddress()
+            ).firstOrNull { !it.isNullOrBlank() } ?: "Unknown Device"
         } catch (e: Exception) {
             Timber.w("Failed to get device name: ${e.message}")
             "Device-${System.currentTimeMillis() % 1000}"
         }
     }
 
-    fun stopDiscovery() {
+    private fun safeGetDeviceName(device: IDevice, index: Int): String {
+        return safeGetDeviceName(device).ifBlank { "Device-$index" }
+    }
+
+    private fun safeGetDeviceId(device: IDevice, fallbackName: String): String {
+        return try {
+            listOf(
+                device.getConnectionInfo()?.getAddress(),
+                device.getDeviceInfo()?.getSerial(),
+                device.Name(),
+                fallbackName
+            ).firstOrNull { !it.isNullOrBlank() } ?: fallbackName
+        } catch (e: Exception) {
+            Timber.w("Failed to get device ID: ${e.message}")
+            fallbackName
+        }
+    }
+
+    override fun stopDiscovery() {
         Timber.d("🔍 Stopped device discovery")
+        discoverySessionId++
+        isAutoReconnecting = false
+        autoReconnectTimeout?.cancel()
         if (mutableReaderConnectionState.value is ReaderConnectionState.Scanning) {
             mutableReaderConnectionState.value = ReaderConnectionState.Idle
         }
     }
 
-    fun connectToDevice(device: ReaderDevice) {
+    override fun connectToDevice(device: ReaderDevice) {
         Timber.d("🔗 Connecting to device: ${device.name}")
         val idevice = deviceMap[device.id]
         if (idevice == null) {
@@ -257,7 +317,7 @@ class RealMagTekGateway(
         }
     }
 
-    fun disconnectDevice() {
+    override fun disconnectDevice() {
         Timber.d("🔌 Disconnecting device")
         // Clear the saved device ID on manual disconnect
         clearSavedDeviceId()
@@ -285,16 +345,28 @@ class RealMagTekGateway(
         val device = activeDevice ?: return AppResult.Failure(AppError.Device("Device disconnected"))
         val payloadCollector = SecurePayloadCollector()
         val completion = CompletableDeferred<AppResult<SecurePaymentData>>()
+        var sawCardDataEvent = false
+        var sawInputRequestEvent = false
+        var sawAuthorizationRequestEvent = false
+        var lastEventType: String = "none"
 
         val subscriber = IEventSubscriber { eventType, data ->
             val event = MagTekSdkEvent(
                 eventTypeName = eventType.name,
                 payload = data?.StringValue() ?: ""
             )
+            lastEventType = event.eventTypeName
+            if (event.eventTypeName == "CardData") sawCardDataEvent = true
+            if (event.eventTypeName == "InputRequest") sawInputRequestEvent = true
+            if (event.eventTypeName == "AuthorizationRequest") sawAuthorizationRequestEvent = true
+
+            // Do not log payload because card artifacts can be sensitive.
+            Timber.d("📨 Terminal event=%s payloadLength=%d", event.eventTypeName, event.payload.length)
             payloadCollector.capture(event)
             callbackMapper.toTransactionState(event)?.let(onStateChanged)
             when {
                 eventType == EventType.AuthorizationRequest -> {
+                    sawAuthorizationRequestEvent = true
                     completion.complete(AppResult.Success(payloadCollector.toSecurePaymentData()))
                 }
                 eventType == EventType.TransactionStatus && event.payload.contains("timedout", ignoreCase = true) -> {
@@ -321,9 +393,26 @@ class RealMagTekGateway(
             return AppResult.Failure(AppError.Device("Unable to start transaction on terminal"))
         }
 
-        val result = withTimeoutOrNull(45_000) {
+        val appWaitTimeoutMs = (TERMINAL_TRANSACTION_TIMEOUT_SECONDS.toLong() * 1000L) + APP_AUTHORIZATION_WAIT_BUFFER_MS
+
+        val result = withTimeoutOrNull(appWaitTimeoutMs) {
             completion.await()
-        } ?: AppResult.Failure(AppError.Device("No authorization request from terminal before timeout"))
+        } ?: run {
+            val timeoutMessage = when {
+                sawAuthorizationRequestEvent -> "Authorization request was received but transaction did not complete"
+                sawCardDataEvent -> "Card was detected but terminal did not request authorization"
+                sawInputRequestEvent -> "Terminal is waiting for customer input (card/PIN)"
+                else -> "No card activity received from terminal"
+            }
+            Timber.w(
+                "⏱️ Authorization wait timed out. lastEvent=%s, cardData=%s, inputRequest=%s, authRequest=%s",
+                lastEventType,
+                sawCardDataEvent,
+                sawInputRequestEvent,
+                sawAuthorizationRequestEvent
+            )
+            AppResult.Failure(AppError.Device(timeoutMessage))
+        }
 
         unsubscribeCurrentSubscriber()
         return result
@@ -354,7 +443,7 @@ class RealMagTekGateway(
             setEMVOnly(false)
             setQuickChip(false)
             setSuppressThankYouMessage(true)
-            setTimeout(60)
+            setTimeout(TERMINAL_TRANSACTION_TIMEOUT_SECONDS)
         }
     }
 

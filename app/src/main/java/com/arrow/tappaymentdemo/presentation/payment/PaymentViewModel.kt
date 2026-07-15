@@ -11,13 +11,16 @@ import com.arrow.tappaymentdemo.domain.usecase.CancelPaymentUseCase
 import com.arrow.tappaymentdemo.domain.usecase.ObserveConnectionStateUseCase
 import com.arrow.tappaymentdemo.domain.usecase.ObserveTransactionStateUseCase
 import com.arrow.tappaymentdemo.domain.usecase.StartPaymentUseCase
-import com.arrow.tappaymentdemo.sdk.magtek.RealMagTekGateway
-import java.math.BigDecimal
+import com.arrow.tappaymentdemo.sdk.magtek.MagTekGateway
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import timber.log.Timber
 
 class PaymentViewModel(
@@ -25,25 +28,18 @@ class PaymentViewModel(
     private val cancelPaymentUseCase: CancelPaymentUseCase,
     observeConnectionStateUseCase: ObserveConnectionStateUseCase,
     observeTransactionStateUseCase: ObserveTransactionStateUseCase,
-    private val magTekGateway: Any? = null  // Accept any MagTekGateway type for testing flexibility
+    private val magTekGateway: MagTekGateway
 ) : ViewModel() {
 
     private val mutableUiState = MutableStateFlow(PaymentUiState())
     val uiState: StateFlow<PaymentUiState> = mutableUiState.asStateFlow()
+    private val prettyJson = Json {
+        prettyPrint = true
+    }
 
-    val readerConnectionState: StateFlow<ReaderConnectionState>
-        get() = if (magTekGateway is RealMagTekGateway) {
-            magTekGateway.readerConnectionState
-        } else {
-            MutableStateFlow(ReaderConnectionState.Idle).asStateFlow()
-        }
+    val readerConnectionState: StateFlow<ReaderConnectionState> = magTekGateway.readerConnectionState
 
-    val discoveredDevices: StateFlow<List<ReaderDevice>>
-        get() = if (magTekGateway is RealMagTekGateway) {
-            magTekGateway.discoveredDevices
-        } else {
-            MutableStateFlow(emptyList<ReaderDevice>()).asStateFlow()
-        }
+    val discoveredDevices: StateFlow<List<ReaderDevice>> = magTekGateway.discoveredDevices
 
     init {
         viewModelScope.launch {
@@ -83,33 +79,31 @@ class PaymentViewModel(
 
     fun startDeviceDiscovery() {
         Timber.d("🔎 Starting device discovery from ViewModel")
-        if (magTekGateway is RealMagTekGateway) {
-            magTekGateway.startDiscovery()
-        }
+        magTekGateway.startDiscovery()
     }
 
     fun stopDeviceDiscovery() {
         Timber.d("🛑 Stopping device discovery from ViewModel")
-        if (magTekGateway is RealMagTekGateway) {
-            magTekGateway.stopDiscovery()
-        }
+        magTekGateway.stopDiscovery()
     }
 
     fun connectToDevice(device: ReaderDevice) {
         Timber.d("🔗 Connecting to device: ${device.name}")
-        if (magTekGateway is RealMagTekGateway) {
-            magTekGateway.connectToDevice(device)
-        }
+        magTekGateway.connectToDevice(device)
     }
 
     fun disconnectDevice() {
         Timber.d("🔌 Disconnecting device")
-        if (magTekGateway is RealMagTekGateway) {
-            magTekGateway.disconnectDevice()
-        }
+        magTekGateway.disconnectDevice()
     }
 
     private fun startPayment() {
+        mutableUiState.update {
+            it.copy(
+                paymentResultHeadline = null,
+                paymentResultSummaryJson = null
+            )
+        }
         val currentState = uiState.value
         val amount = currentState.amount.toBigDecimalOrNull()
         if (amount == null) {
@@ -135,11 +129,26 @@ class PaymentViewModel(
                     } else {
                         "Declined: ${result.data.declineReason ?: "Unknown reason"}"
                     }
-                    mutableUiState.update { it.copy(userMessage = message) }
+                    val headline = if (result.data.approved) "Payment approved" else "Payment declined"
+                    mutableUiState.update {
+                        it.copy(
+                            userMessage = message,
+                            paymentResultHeadline = headline,
+                            paymentResultSummaryJson = result.data.humanReadableSummaryJson
+                                ?: fallbackResultJson(message = message, approved = result.data.approved)
+                        )
+                    }
                 }
 
                 is AppResult.Failure -> {
-                    mutableUiState.update { it.copy(userMessage = result.error.userMessage) }
+                    val message = result.error.userMessage
+                    mutableUiState.update {
+                        it.copy(
+                            userMessage = message,
+                            paymentResultHeadline = "Payment could not be completed",
+                            paymentResultSummaryJson = fallbackResultJson(message = message, approved = false)
+                        )
+                    }
                 }
             }
         }
@@ -148,8 +157,28 @@ class PaymentViewModel(
     private fun cancelPayment() {
         viewModelScope.launch {
             cancelPaymentUseCase()
-            mutableUiState.update { it.copy(userMessage = "Payment cancelled") }
+            val message = "Payment cancelled"
+            mutableUiState.update {
+                it.copy(
+                    userMessage = message,
+                    paymentResultHeadline = message,
+                    paymentResultSummaryJson = fallbackResultJson(message = message, approved = false)
+                )
+            }
         }
+    }
+
+    private fun fallbackResultJson(message: String, approved: Boolean): String {
+        val jsonObject = buildJsonObject {
+            put("status", if (approved) "Approved" else "Not approved")
+            put("simpleMessage", message)
+            put(
+                "nextStep",
+                if (approved) "Share receipt with customer and complete checkout."
+                else "Retry payment or use another payment method."
+            )
+        }
+        return prettyJson.encodeToString(JsonObject.serializer(), jsonObject)
     }
 }
 

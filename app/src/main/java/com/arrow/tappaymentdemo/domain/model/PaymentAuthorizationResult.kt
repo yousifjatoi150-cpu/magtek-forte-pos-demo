@@ -4,6 +4,7 @@ data class PaymentAuthorizationResult(
     val approved: Boolean,
     val transactionId: String,
     val authorizationCode: String?,
-    val declineReason: String?
+    val declineReason: String?,
+    val humanReadableSummaryJson: String? = null
 )
 

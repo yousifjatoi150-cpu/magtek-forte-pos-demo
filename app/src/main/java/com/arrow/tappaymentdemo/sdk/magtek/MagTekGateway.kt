@@ -4,6 +4,8 @@ import com.arrow.tappaymentdemo.core.result.AppError
 import com.arrow.tappaymentdemo.core.result.AppResult
 import com.arrow.tappaymentdemo.domain.model.ConnectionState
 import com.arrow.tappaymentdemo.domain.model.PaymentRequestContext
+import com.arrow.tappaymentdemo.domain.model.ReaderConnectionState
+import com.arrow.tappaymentdemo.domain.model.ReaderDevice
 import com.arrow.tappaymentdemo.domain.model.SecurePaymentData
 import com.arrow.tappaymentdemo.domain.model.TransactionState
 import kotlinx.coroutines.delay
@@ -13,6 +15,13 @@ import kotlinx.coroutines.flow.asStateFlow
 
 interface MagTekGateway {
     val connectionState: StateFlow<ConnectionState>
+    val readerConnectionState: StateFlow<ReaderConnectionState>
+    val discoveredDevices: StateFlow<List<ReaderDevice>>
+
+    fun startDiscovery()
+    fun stopDiscovery()
+    fun connectToDevice(device: ReaderDevice)
+    fun disconnectDevice()
 
     suspend fun startEmvTransaction(
         context: PaymentRequestContext,
@@ -24,8 +33,33 @@ interface MagTekGateway {
 
 class FakeMagTekGateway : MagTekGateway {
     private val mutableConnectionState = MutableStateFlow<ConnectionState>(ConnectionState.Connected)
+    private val mutableReaderConnectionState = MutableStateFlow<ReaderConnectionState>(ReaderConnectionState.Connected(deviceId = "fake-reader", name = "Fake Reader"))
+    private val mutableDiscoveredDevices = MutableStateFlow(
+        listOf(ReaderDevice(id = "fake-reader", name = "Fake Reader"))
+    )
 
     override val connectionState: StateFlow<ConnectionState> = mutableConnectionState.asStateFlow()
+    override val readerConnectionState: StateFlow<ReaderConnectionState> = mutableReaderConnectionState.asStateFlow()
+    override val discoveredDevices: StateFlow<List<ReaderDevice>> = mutableDiscoveredDevices.asStateFlow()
+
+    override fun startDiscovery() {
+        mutableReaderConnectionState.value = ReaderConnectionState.Scanning
+        mutableReaderConnectionState.value = ReaderConnectionState.Idle
+    }
+
+    override fun stopDiscovery() {
+        mutableReaderConnectionState.value = ReaderConnectionState.Idle
+    }
+
+    override fun connectToDevice(device: ReaderDevice) {
+        mutableReaderConnectionState.value = ReaderConnectionState.Connected(device.id, device.name)
+        mutableConnectionState.value = ConnectionState.Connected
+    }
+
+    override fun disconnectDevice() {
+        mutableReaderConnectionState.value = ReaderConnectionState.Idle
+        mutableConnectionState.value = ConnectionState.Disconnected
+    }
 
     override suspend fun startEmvTransaction(
         context: PaymentRequestContext,

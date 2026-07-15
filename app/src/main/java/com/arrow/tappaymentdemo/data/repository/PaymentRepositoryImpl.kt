@@ -2,6 +2,7 @@ package com.arrow.tappaymentdemo.data.repository
 
 import com.arrow.tappaymentdemo.core.result.AppResult
 import com.arrow.tappaymentdemo.data.mapper.BackendPaymentRequestMapper
+import com.arrow.tappaymentdemo.data.mapper.PaymentResultSummaryMapper
 import com.arrow.tappaymentdemo.domain.model.ConnectionState
 import com.arrow.tappaymentdemo.domain.model.PaymentAuthorizationResult
 import com.arrow.tappaymentdemo.domain.model.PaymentRequestContext
@@ -18,7 +19,8 @@ import timber.log.Timber
 class PaymentRepositoryImpl(
     private val magTekGateway: MagTekGateway,
     private val backendPaymentApi: BackendPaymentApi,
-    private val backendPaymentRequestMapper: BackendPaymentRequestMapper
+    private val backendPaymentRequestMapper: BackendPaymentRequestMapper,
+    private val paymentResultSummaryMapper: PaymentResultSummaryMapper
 ) : PaymentRepository {
 
     override val connectionState: StateFlow<ConnectionState> = magTekGateway.connectionState
@@ -53,11 +55,13 @@ class PaymentRepositoryImpl(
             is AppResult.Success -> {
                 val response = backendResult.data
                 Timber.d("✅ Backend response: success=${response.success}, msg=${response.message}")
+                val readableSummary = paymentResultSummaryMapper.toHumanReadableJson(response)
                 val authorizationResult = PaymentAuthorizationResult(
                     approved = response.success,
                     transactionId = response.data?.paymentId ?: response.data?.gatewayTransactionId.orEmpty(),
                     authorizationCode = response.data?.authorizationCode,
-                    declineReason = if (!response.success) response.message ?: "Declined" else null
+                    declineReason = if (!response.success) response.message ?: "Declined" else null,
+                    humanReadableSummaryJson = readableSummary
                 )
                 mutableTransactionState.value = if (authorizationResult.approved) {
                     TransactionState.Approved(

@@ -14,7 +14,9 @@ data class PaymentUiState(
     val connectionState: ConnectionState = ConnectionState.Disconnected,
     val transactionState: TransactionState = TransactionState.Idle,
     val isProcessing: Boolean = false,
-    val userMessage: String? = null
+    val userMessage: String? = null,
+    val paymentResultHeadline: String? = null,
+    val paymentResultSummaryJson: String? = null
 )
 
 sealed interface PaymentUiEvent {
