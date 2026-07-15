@@ -1,7 +1,12 @@
 package com.arrow.tappaymentdemo.sdk.magtek
 
+import android.Manifest
+import android.bluetooth.BluetoothManager
 import android.content.Context
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
 import com.arrow.tappaymentdemo.core.result.AppError
 import com.arrow.tappaymentdemo.core.result.AppResult
 import com.arrow.tappaymentdemo.domain.model.ConnectionState
@@ -119,6 +124,16 @@ class RealMagTekGateway(
     // MARK: - Device Discovery
 
     fun startDiscovery() {
+        val discoveryError = validateDiscoveryPrerequisites()
+        if (discoveryError != null) {
+            Timber.w("⚠️ Discovery prerequisites not met: $discoveryError")
+            mutableReaderConnectionState.value = ReaderConnectionState.Error(discoveryError)
+            mutableConnectionState.value = ConnectionState.Error(discoveryError)
+            isAutoReconnecting = false
+            autoReconnectTimeout?.cancel()
+            return
+        }
+
         Timber.d("🔍 Starting device discovery")
         mutableReaderConnectionState.value = ReaderConnectionState.Scanning
         mutableDiscoveredDevices.value = emptyList()
@@ -127,7 +142,6 @@ class RealMagTekGateway(
         val callback = IDeviceListCallback { deviceList ->
             Timber.d("📡 Device discovery callback: found ${deviceList?.size ?: 0} devices")
             val devices = mutableListOf<ReaderDevice>()
-            var foundAutoReconnectDevice = false
             val savedDeviceId = getSavedDeviceId()
 
             deviceList?.forEachIndexed { index, idevice ->
@@ -138,7 +152,6 @@ class RealMagTekGateway(
 
                 // Check if this is the auto-reconnect device
                 if (isAutoReconnecting && savedDeviceId == deviceId) {
-                    foundAutoReconnectDevice = true
                     Timber.d("🔁 Found saved device during auto-reconnect: $deviceId")
                     // Auto-connect to this device
                     autoReconnectTimeout?.cancel()
@@ -152,7 +165,50 @@ class RealMagTekGateway(
             Timber.d("📡 Discovered devices: ${devices.map { it.name }}")
         }
 
-        CoreAPI.getDeviceList(appContext, callback)
+        try {
+            CoreAPI.getDeviceList(appContext, callback)
+        } catch (securityException: SecurityException) {
+            val message = "Missing nearby devices permission for discovery"
+            Timber.e(securityException, "❌ $message")
+            mutableReaderConnectionState.value = ReaderConnectionState.Error(message)
+            mutableConnectionState.value = ConnectionState.Error(message)
+            isAutoReconnecting = false
+            autoReconnectTimeout?.cancel()
+        } catch (exception: Exception) {
+            val message = "Failed to start device discovery"
+            Timber.e(exception, "❌ $message")
+            mutableReaderConnectionState.value = ReaderConnectionState.Error(message)
+            mutableConnectionState.value = ConnectionState.Error(message)
+            isAutoReconnecting = false
+            autoReconnectTimeout?.cancel()
+        }
+    }
+
+    private fun validateDiscoveryPrerequisites(): String? {
+        val hasRequiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            hasPermission(Manifest.permission.BLUETOOTH_SCAN) &&
+                hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+        if (!hasRequiredPermissions) {
+            return "Required Bluetooth permissions are not granted"
+        }
+
+        val bluetoothManager = appContext.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter = bluetoothManager?.adapter
+        if (adapter == null) {
+            return "Bluetooth adapter unavailable on this device"
+        }
+        if (!adapter.isEnabled) {
+            return "Bluetooth is turned off"
+        }
+
+        return null
+    }
+
+    private fun hasPermission(permission: String): Boolean {
+        return ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun safeGetDeviceName(device: IDevice): String {
