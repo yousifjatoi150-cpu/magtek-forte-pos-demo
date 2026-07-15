@@ -1,0 +1,383 @@
+package com.arrow.tappaymentdemo.sdk.magtek
+
+import android.content.Context
+import android.content.SharedPreferences
+import com.arrow.tappaymentdemo.core.result.AppError
+import com.arrow.tappaymentdemo.core.result.AppResult
+import com.arrow.tappaymentdemo.domain.model.ConnectionState
+import com.arrow.tappaymentdemo.domain.model.PaymentRequestContext
+import com.arrow.tappaymentdemo.domain.model.ReaderConnectionState
+import com.arrow.tappaymentdemo.domain.model.ReaderDevice
+import com.arrow.tappaymentdemo.domain.model.SecurePaymentData
+import com.arrow.tappaymentdemo.domain.model.TransactionState
+import com.magtek.mobile.android.mtusdk.CoreAPI
+import com.magtek.mobile.android.mtusdk.EventType
+import com.magtek.mobile.android.mtusdk.IDevice
+import com.magtek.mobile.android.mtusdk.IDeviceListCallback
+import com.magtek.mobile.android.mtusdk.IEventSubscriber
+import com.magtek.mobile.android.mtusdk.PaymentMethod
+import com.magtek.mobile.android.mtusdk.Transaction
+import java.math.RoundingMode
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import timber.log.Timber
+
+class RealMagTekGateway(
+    private val appContext: Context,
+    private val callbackMapper: MagTekCallbackToTransactionStateMapper
+) : MagTekGateway {
+
+    private val mutableConnectionState = MutableStateFlow<ConnectionState>(ConnectionState.Disconnected)
+    override val connectionState: StateFlow<ConnectionState> = mutableConnectionState.asStateFlow()
+
+    private val mutableReaderConnectionState = MutableStateFlow<ReaderConnectionState>(ReaderConnectionState.Idle)
+    val readerConnectionState: StateFlow<ReaderConnectionState> get() = mutableReaderConnectionState.asStateFlow()
+
+    private val mutableDiscoveredDevices = MutableStateFlow<List<ReaderDevice>>(emptyList())
+    val discoveredDevices: StateFlow<List<ReaderDevice>> get() = mutableDiscoveredDevices.asStateFlow()
+
+    private var activeDevice: IDevice? = null
+    private var activeSubscriber: IEventSubscriber? = null
+    private val deviceMap = mutableMapOf<String, IDevice>()
+
+    // Auto-reconnect state
+    private var isAutoReconnecting = false
+    private var autoReconnectTimeout: Job? = null
+    private val prefs: SharedPreferences by lazy {
+        appContext.getSharedPreferences("magtek_prefs", Context.MODE_PRIVATE)
+    }
+
+    companion object {
+        private const val SAVED_DEVICE_ID_KEY = "saved_magtek_device_id"
+        private const val AUTO_RECONNECT_TIMEOUT_MS = 15000L
+    }
+
+    init {
+        Timber.d("🔌 MagTek Gateway initialized - attempting auto-reconnect")
+        startAutoReconnect()
+    }
+
+    // MARK: - Auto-Reconnect
+
+    fun startAutoReconnect() {
+        val savedDeviceId = getSavedDeviceId()
+        if (savedDeviceId == null || isAutoReconnecting || mutableReaderConnectionState.value.isConnected) {
+            Timber.d("🔁 Auto-reconnect skipped: savedId=$savedDeviceId, autoRecon=$isAutoReconnecting, connected=${mutableReaderConnectionState.value.isConnected}")
+            return
+        }
+
+        Timber.d("🔁 Starting auto-reconnect for device: $savedDeviceId")
+        isAutoReconnecting = true
+        mutableReaderConnectionState.value = ReaderConnectionState.Scanning
+
+        // Cancel any existing timeout
+        autoReconnectTimeout?.cancel()
+
+        // Start discovery
+        startDiscovery()
+
+        // Set timeout - if device not found in time, stop scanning
+        autoReconnectTimeout = GlobalScope.launch {
+            try {
+                delay(AUTO_RECONNECT_TIMEOUT_MS)
+                if (isAutoReconnecting) {
+                    Timber.d("🔁 Auto-reconnect timeout - device not found")
+                    isAutoReconnecting = false
+                    stopDiscovery()
+                    if (mutableReaderConnectionState.value is ReaderConnectionState.Scanning) {
+                        mutableReaderConnectionState.value = ReaderConnectionState.Idle
+                    }
+                }
+            } catch (e: Exception) {
+                Timber.e(e, "Auto-reconnect timeout error")
+            }
+        }
+    }
+
+    private fun getSavedDeviceId(): String? {
+        val saved = prefs.getString(SAVED_DEVICE_ID_KEY, null)
+        return if (saved.isNullOrEmpty()) null else saved
+    }
+
+    private fun saveDeviceId(deviceId: String) {
+        prefs.edit().putString(SAVED_DEVICE_ID_KEY, deviceId).apply()
+        Timber.d("💾 Saved device ID: $deviceId")
+    }
+
+    private fun clearSavedDeviceId() {
+        prefs.edit().remove(SAVED_DEVICE_ID_KEY).apply()
+        Timber.d("🗑️ Cleared saved device ID")
+    }
+
+    // MARK: - Device Discovery
+
+    fun startDiscovery() {
+        Timber.d("🔍 Starting device discovery")
+        mutableReaderConnectionState.value = ReaderConnectionState.Scanning
+        mutableDiscoveredDevices.value = emptyList()
+        deviceMap.clear()
+
+        val callback = IDeviceListCallback { deviceList ->
+            Timber.d("📡 Device discovery callback: found ${deviceList?.size ?: 0} devices")
+            val devices = mutableListOf<ReaderDevice>()
+            var foundAutoReconnectDevice = false
+            val savedDeviceId = getSavedDeviceId()
+
+            deviceList?.forEachIndexed { index, idevice ->
+                val deviceName = idevice?.let { safeGetDeviceName(it) } ?: "Device-$index"
+                val deviceId = deviceName // Use name as ID for simplicity
+                devices.add(ReaderDevice(id = deviceId, name = deviceName))
+                deviceMap[deviceId] = idevice
+
+                // Check if this is the auto-reconnect device
+                if (isAutoReconnecting && savedDeviceId == deviceId) {
+                    foundAutoReconnectDevice = true
+                    Timber.d("🔁 Found saved device during auto-reconnect: $deviceId")
+                    // Auto-connect to this device
+                    autoReconnectTimeout?.cancel()
+                    isAutoReconnecting = false
+                    connectToDevice(ReaderDevice(id = deviceId, name = deviceName))
+                }
+            }
+
+            devices.sortByDescending { it.isLikelyReader }
+            mutableDiscoveredDevices.value = devices
+            Timber.d("📡 Discovered devices: ${devices.map { it.name }}")
+        }
+
+        CoreAPI.getDeviceList(appContext, callback)
+    }
+
+    private fun safeGetDeviceName(device: IDevice): String {
+        return try {
+            // Try to get the name from the device
+            device.toString().ifEmpty { "Unknown Device" }
+        } catch (e: Exception) {
+            Timber.w("Failed to get device name: ${e.message}")
+            "Device-${System.currentTimeMillis() % 1000}"
+        }
+    }
+
+    fun stopDiscovery() {
+        Timber.d("🔍 Stopped device discovery")
+        if (mutableReaderConnectionState.value is ReaderConnectionState.Scanning) {
+            mutableReaderConnectionState.value = ReaderConnectionState.Idle
+        }
+    }
+
+    fun connectToDevice(device: ReaderDevice) {
+        Timber.d("🔗 Connecting to device: ${device.name}")
+        val idevice = deviceMap[device.id]
+        if (idevice == null) {
+            Timber.e("❌ Device not found in map: ${device.id}")
+            mutableReaderConnectionState.value = ReaderConnectionState.Error("Device not found")
+            return
+        }
+
+        stopDiscovery()
+        mutableReaderConnectionState.value = ReaderConnectionState.Connecting(device.id)
+        activeDevice = idevice
+
+        val opened = idevice.getDeviceControl().open()
+        if (opened) {
+            mutableReaderConnectionState.value = ReaderConnectionState.Connected(device.id, device.name)
+            mutableConnectionState.value = ConnectionState.Connected
+            // Save the paired device ID for future auto-reconnect
+            saveDeviceId(device.id)
+            isAutoReconnecting = false
+            autoReconnectTimeout?.cancel()
+            Timber.d("✅ Device connected and saved: ${device.name}")
+        } else {
+            mutableReaderConnectionState.value = ReaderConnectionState.Error("Failed to connect to device")
+            mutableConnectionState.value = ConnectionState.Error("Failed to connect to device")
+            Timber.e("❌ Failed to open device")
+        }
+    }
+
+    fun disconnectDevice() {
+        Timber.d("🔌 Disconnecting device")
+        // Clear the saved device ID on manual disconnect
+        clearSavedDeviceId()
+        isAutoReconnecting = false
+        autoReconnectTimeout?.cancel()
+
+        if (activeDevice != null) {
+            activeDevice?.getDeviceControl()?.close()
+        }
+        activeDevice = null
+        mutableReaderConnectionState.value = ReaderConnectionState.Idle
+        mutableConnectionState.value = ConnectionState.Disconnected
+    }
+
+    // MARK: - EMV Transaction
+
+    override suspend fun startEmvTransaction(
+        context: PaymentRequestContext,
+        onStateChanged: (TransactionState) -> Unit
+    ): AppResult<SecurePaymentData> {
+        if (activeDevice == null) {
+            return AppResult.Failure(AppError.Device("No device connected. Connect a reader first."))
+        }
+
+        val device = activeDevice ?: return AppResult.Failure(AppError.Device("Device disconnected"))
+        val payloadCollector = SecurePayloadCollector()
+        val completion = CompletableDeferred<AppResult<SecurePaymentData>>()
+
+        val subscriber = IEventSubscriber { eventType, data ->
+            val event = MagTekSdkEvent(
+                eventTypeName = eventType.name,
+                payload = data?.StringValue() ?: ""
+            )
+            payloadCollector.capture(event)
+            callbackMapper.toTransactionState(event)?.let(onStateChanged)
+            when {
+                eventType == EventType.AuthorizationRequest -> {
+                    completion.complete(AppResult.Success(payloadCollector.toSecurePaymentData()))
+                }
+                eventType == EventType.TransactionStatus && event.payload.contains("timedout", ignoreCase = true) -> {
+                    completion.complete(AppResult.Failure(AppError.Device("Transaction timed out on terminal")))
+                }
+                eventType == EventType.TransactionStatus && event.payload.contains("cancel", ignoreCase = true) -> {
+                    completion.complete(AppResult.Failure(AppError.Device("Transaction cancelled on terminal")))
+                }
+                eventType == EventType.TransactionStatus &&
+                    (event.payload.contains("error", ignoreCase = true) ||
+                        event.payload.contains("failed", ignoreCase = true)) -> {
+                    completion.complete(AppResult.Failure(AppError.Device("Terminal reported transaction failure")))
+                }
+            }
+        }
+
+        activeSubscriber = subscriber
+        device.subscribeAll(subscriber)
+
+        onStateChanged(TransactionState.WaitingForCard)
+        val started = device.startTransaction(buildTransaction(context))
+        if (!started) {
+            unsubscribeCurrentSubscriber()
+            return AppResult.Failure(AppError.Device("Unable to start transaction on terminal"))
+        }
+
+        val result = withTimeoutOrNull(45_000) {
+            completion.await()
+        } ?: AppResult.Failure(AppError.Device("No authorization request from terminal before timeout"))
+
+        unsubscribeCurrentSubscriber()
+        return result
+    }
+
+    override suspend fun cancelTransaction(): AppResult<Unit> {
+        val device = activeDevice
+            ?: return AppResult.Failure(AppError.Device("No active terminal session"))
+
+        return if (device.cancelTransaction()) {
+            AppResult.Success(Unit)
+        } else {
+            AppResult.Failure(AppError.Device("Terminal did not accept cancellation"))
+        }
+    }
+
+    private fun buildTransaction(context: PaymentRequestContext): Transaction {
+        val paymentMethods = listOf(
+            PaymentMethod.Contact,
+            PaymentMethod.Contactless,
+            PaymentMethod.MSR
+        )
+
+        return Transaction().apply {
+            setAmount(context.amount.setScale(2, RoundingMode.HALF_UP).toPlainString())
+            setCashBack("0.00")
+            setPaymentMethods(paymentMethods)
+            setEMVOnly(false)
+            setQuickChip(false)
+            setSuppressThankYouMessage(true)
+            setTimeout(60)
+        }
+    }
+
+    private fun unsubscribeCurrentSubscriber() {
+        val device = activeDevice
+        val subscriber = activeSubscriber
+        if (device != null && subscriber != null) {
+            device.unsubscribeAll(subscriber)
+        }
+        activeSubscriber = null
+    }
+
+    private class SecurePayloadCollector {
+        private var encryptedTrackData: String = ""
+        private var emvTlvData: String = ""
+        private var pinBlock: String = ""
+        private var deviceSerial: String = "UNKNOWN"
+        private var entryMethod: String = "UNKNOWN"
+        private var last4: String = "1111"
+
+        fun capture(event: MagTekSdkEvent) {
+            when (event.eventTypeName) {
+                "CardData" -> {
+                    encryptedTrackData = event.payload
+                    last4 = extractLast4(event.payload)
+                }
+                "AuthorizationRequest", "TransactionResult" -> {
+                    emvTlvData = event.payload
+                }
+                "PINBlock", "PINData" -> {
+                    pinBlock = event.payload
+                }
+                "ConnectionState" -> {
+                    if (event.payload.contains("usb", ignoreCase = true)) {
+                        entryMethod = "USB"
+                    }
+                }
+                "TransactionStatus" -> {
+                    if (event.payload.contains("contactless", ignoreCase = true)) {
+                        entryMethod = "CONTACTLESS"
+                    } else if (event.payload.contains("insert", ignoreCase = true)) {
+                        entryMethod = "CONTACT"
+                    } else if (event.payload.contains("swipe", ignoreCase = true)) {
+                        entryMethod = "MSR"
+                    }
+                }
+                "DeviceEvent" -> {
+                    deviceSerial = extractDeviceSerial(event.payload)
+                }
+            }
+        }
+
+        fun toSecurePaymentData(): SecurePaymentData {
+            return SecurePaymentData(
+                maskedPan = "************$last4",
+                encryptedTrackData = encryptedTrackData.ifEmpty { "encrypted_track_payload" },
+                emvTlvData = emvTlvData.ifEmpty { "emv_tlv_payload" },
+                pinBlock = pinBlock.ifEmpty { "encrypted_pin_block" },
+                deviceSerial = deviceSerial,
+                entryMethod = entryMethod
+            )
+        }
+
+        private fun extractLast4(payload: String): String {
+            val digits = payload.filter { it.isDigit() }
+            return if (digits.length >= 4) digits.takeLast(4) else "1111"
+        }
+
+        private fun extractDeviceSerial(payload: String): String {
+            if (payload.isBlank()) {
+                return "UNKNOWN"
+            }
+            return payload.take(32)
+        }
+    }
+}
+
+
+
+
+
+
